@@ -1,0 +1,37 @@
+# Large data and model files
+data/raw/
+data/processed/
+data/generated/
+results/
+clip_model/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+*.so
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+.venv/
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# SLURM logs
+*.out
+*.err
+slurm-*.out
+
+# Claude Code
+.claude/
