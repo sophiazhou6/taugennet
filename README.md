@@ -2,9 +2,6 @@
 
 A 3D latent diffusion model for synthesizing tau PET brain scans conditioned on structural MRI and plasma biomarkers. Trained and evaluated on the ADNI dataset (187 subjects, AD and MCI cohorts).
 
-**Paper:** *Plasma-Driven Tau PET Image Synthesis via Text-Guided 3D Diffusion Models*  
-DOI: 10.1109/TRPMS.2026.3688162
-
 ---
 
 ## Overview
