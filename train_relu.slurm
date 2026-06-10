@@ -23,10 +23,10 @@ cd /scratch/network/sz3962/taugennet
 
 # ── Directories ───────────────────────────────────────────────────────────────
 mkdir -p results/logs \
-         results/checkpoints/atrophy_paper \
-         results/checkpoints/ptau217_paper \
-         results/checkpoints/combined_paper \
-         results/figures/monitor_paper
+         results/checkpoints/atrophy_relu \
+         results/checkpoints/ptau217_relu \
+         results/checkpoints/combined_relu \
+         results/figures/monitor_relu
 
 # ── Info ──────────────────────────────────────────────────────────────────────
 echo "Job ID:      $SLURM_JOB_ID"
@@ -52,8 +52,8 @@ $PYTHON scripts/train_relu.py \
     --patience 500 \
     --val-every 10 \
     --monitor-every 25 \
-    --monitor-dir results/figures/monitor_paper \
-    --checkpoint-dir results/checkpoints/atrophy_paper
+    --monitor-dir results/figures/monitor_relu \
+    --checkpoint-dir results/checkpoints/atrophy_relu
 echo "Stage 2 done at: $(date)"
 echo ""
 
@@ -68,8 +68,8 @@ $PYTHON scripts/train_relu.py \
     --patience 500 \
     --val-every 10 \
     --monitor-every 25 \
-    --monitor-dir results/figures/monitor_paper \
-    --checkpoint-dir results/checkpoints/ptau217_paper
+    --monitor-dir results/figures/monitor_relu \
+    --checkpoint-dir results/checkpoints/ptau217_relu
 echo "Stage 3 done at: $(date)"
 echo ""
 
@@ -84,8 +84,8 @@ $PYTHON scripts/train_relu.py \
     --patience 500 \
     --val-every 10 \
     --monitor-every 25 \
-    --monitor-dir results/figures/monitor_paper \
-    --checkpoint-dir results/checkpoints/combined_paper
+    --monitor-dir results/figures/monitor_relu \
+    --checkpoint-dir results/checkpoints/combined_relu
 echo "Stage 4 done at: $(date)"
 echo ""
 

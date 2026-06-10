@@ -32,12 +32,12 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-from src.config import (DEVICE, T_STEPS, LR, AE_EPOCHS, DIFF_EPOCHS, BATCH_SIZE,
-                        AE_CHECKPOINT_PATH, CHECKPOINT_DIR, FIGURES_DIR, LATENT_CH)
+from src.config_relu import (DEVICE, T_STEPS, LR, AE_EPOCHS, DIFF_EPOCHS, BATCH_SIZE,
+                             AE_CHECKPOINT_PATH, CHECKPOINT_DIR, FIGURES_DIR, LATENT_CH)
 from src.dataset      import build_dataloaders
-from src import dataset_v2       as _dataset_v2
-from src import dataset_combined as _dataset_combined
-from src.models       import Autoencoder3D, DenoisingUNet3D
+from src import dataset_v2_relu    as _dataset_v2
+from src import dataset_combined_relu as _dataset_combined
+from src.models_relu  import Autoencoder3D, DenoisingUNet3D
 from src.diffusion    import DiffusionSchedule
 from src.conditioning import build_conditioner
 from src.inference    import synthesize_tau_pet
@@ -354,9 +354,7 @@ def parse_args():
     p.add_argument("--val-every",      type=int,  default=10)
     p.add_argument("--monitor-every",  type=int,  default=25)
     p.add_argument("--dataset",        choices=["v1", "v2"], default="v1",
-                   help="v1=original 72/11/28 split; v2=configurable split via --split (dataset_v2.py)")
-    p.add_argument("--split",          type=str,  default="70/10/20",
-                   help="Train/val/test split percentages for --dataset v2, e.g. '80/10/10'")
+                   help="v1=original 72/11/28 split; v2=70/10/20 split (dataset_v2.py)")
     p.add_argument("--monitor-dir",    type=str,  default=None,
                    help="Directory for epoch monitoring figures (default: FIGURES_DIR/monitor)")
     p.add_argument("--use-mask",       action="store_true", default=False,
@@ -372,25 +370,15 @@ def main():
     diff_ckpt = os.path.join(args.checkpoint_dir, f"diff_{args.mode}.pt")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    split_parts = [int(x) for x in args.split.split("/")]
-    train_frac, val_frac = split_parts[0] / 100, split_parts[1] / 100
-
     if args.mode == "combined":
         train_ds, val_ds, test_ds, train_loader, val_loader, _ = \
-            _dataset_combined.build_dataloaders(
-                mode=args.mode, batch_size=args.batch_size, use_mask=args.use_mask,
-                train_frac=train_frac, val_frac=val_frac,
-            )
+            _dataset_combined.build_dataloaders(mode=args.mode, batch_size=args.batch_size, use_dk_mask=args.use_mask)
     elif args.dataset == "v2":
         train_ds, val_ds, test_ds, train_loader, val_loader, _ = \
-            _dataset_v2.build_dataloaders(
-                mode=args.mode, batch_size=args.batch_size, use_dk_mask=args.use_mask,
-                train_frac=train_frac, val_frac=val_frac,
-            )
+            _dataset_v2.build_dataloaders(mode=args.mode, batch_size=args.batch_size, use_dk_mask=args.use_mask)
     else:
-        train_ds, val_ds, test_ds, train_loader, val_loader, _ = build_dataloaders(
-            mode=args.mode, batch_size=args.batch_size, use_dk_mask=args.use_mask
-        )
+        train_ds, val_ds, test_ds, train_loader, val_loader, _ = \
+            build_dataloaders(mode=args.mode, batch_size=args.batch_size, use_mask=args.use_mask)
     print(f"Mode: {args.mode}  |  train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)}")
 
     # ── Models ────────────────────────────────────────────────────────────────

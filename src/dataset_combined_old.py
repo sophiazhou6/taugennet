@@ -81,8 +81,6 @@ class TauPETDataset(Dataset):
     Returns (pet, mri, cond_data) where:
       pet, mri   – (1, H, W, D) float tensor normalised to [0, 1]
       cond_data  – (87,) = [atrophy z-scores (86) ‖ ptau217 scalar (1)]
-
-    Volumes are masked to include only the 86 Desikan-Killiany atlas regions.
     """
 
     def __init__(self, pet_paths, mri_paths, cond_values, use_dk_mask=True):
@@ -111,14 +109,14 @@ class TauPETDataset(Dataset):
     def _load(self, path, mask=None):
         import nibabel as nib
         vol = nib.load(path).get_fdata().astype(np.float32)
+        vol = (vol - vol.min()) / (vol.max() - vol.min() + 1e-8)
         vol = torch.tensor(vol).unsqueeze(0)
         vol = F.interpolate(
             vol.unsqueeze(0), size=VOL_SHAPE, mode="trilinear", align_corners=False
         ).squeeze(0)
         if mask is not None:
             vol = vol * mask
-        vmin, vmax = vol.min(), vol.max()
-        return (vol - vmin) / (vmax - vmin + 1e-8)
+        return vol
 
     def __len__(self):
         return len(self.pet_paths)
@@ -177,13 +175,11 @@ def _build_rid_to_ptau(fluid_csv):
 
 
 def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
-                      batch_size=BATCH_SIZE, seed=SEED, use_mask=False,
-                      train_frac=0.70, val_frac=0.10):
+                      batch_size=BATCH_SIZE, seed=SEED, use_dk_mask=True):
     """
-    mode      : must be 'combined'
-    train_frac: fraction of subjects for training (default 0.70)
-    val_frac  : fraction of subjects for validation (default 0.10); test absorbs remainder
-    cond      : (87,) = [atrophy z-scores (86) ‖ ptau217 (1)]
+    mode  : must be 'combined'
+    Split : 80% train / 10% val / 10% test.
+    cond  : (87,) = [atrophy z-scores (86) ‖ ptau217 (1)]
     Returns: train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
     """
     if mode != "combined":
@@ -226,15 +222,13 @@ def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
     cond_vals = [cond_vals[i] for i in indices]
 
     n       = len(pet_paths)
-    train_n = int(train_frac * n)
-    val_n   = int(val_frac * n)
+    train_n = int(0.80 * n)
+    val_n   = int(0.10 * n)
 
-    train_ds = TauPETDataset(pet_paths[:train_n],              mri_paths[:train_n],              cond_vals[:train_n],              use_dk_mask=use_mask)
-    val_ds   = TauPETDataset(pet_paths[train_n:train_n+val_n], mri_paths[train_n:train_n+val_n], cond_vals[train_n:train_n+val_n], use_dk_mask=use_mask)
-    test_ds  = TauPETDataset(pet_paths[train_n+val_n:],        mri_paths[train_n+val_n:],        cond_vals[train_n+val_n:],        use_dk_mask=use_mask)
-    test_frac = round(1.0 - train_frac - val_frac, 2)
-    print(f"Split ({int(train_frac*100)}/{int(val_frac*100)}/{int(test_frac*100)}): "
-          f"{len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
+    train_ds = TauPETDataset(pet_paths[:train_n],              mri_paths[:train_n],              cond_vals[:train_n],              use_dk_mask=use_dk_mask)
+    val_ds   = TauPETDataset(pet_paths[train_n:train_n+val_n], mri_paths[train_n:train_n+val_n], cond_vals[train_n:train_n+val_n], use_dk_mask=use_dk_mask)
+    test_ds  = TauPETDataset(pet_paths[train_n+val_n:],        mri_paths[train_n+val_n:],        cond_vals[train_n+val_n:],        use_dk_mask=use_dk_mask)
+    print(f"Split (80/10/10): {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)

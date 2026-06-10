@@ -1,15 +1,16 @@
 """
-dataset_combined.py – ADNI dataset loader for combined atrophy + ptau217 conditioning.
+dataset_combined_relu.py – ADNI dataset loader for combined atrophy + ptau217 conditioning with ReLU config.
 
 mode='combined'
     Conditioning data: 87-dim vector = [atrophy z-scores (86), ptau217 scalar (1)].
     Only subjects with MRI, PET, atrophy z-scores, AND ptau217 values are included.
-    Split: 80 / 10 / 10  train / val / test.
+    Split: 70 / 10 / 20  train / val / test.
+    Uses config_relu with VOL_SHAPE = (96, 112, 96)
 
 Both conditioning signals are concatenated into a single (87,) tensor so the
 CombinedConditioner can split them back apart (first 86 = atrophy, last 1 = ptau).
 
-Masking: Uses Desikan-Killiany (DK) atlas (86 regions) via RegionLabelMap.py.
+Masking: Uses Desikan-Killiany (DK) atlas (86 regions).
 Only voxels within the 86 DK regions are retained; non-brain regions are masked out.
 """
 
@@ -23,7 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 
-from .config import BASE_DIR, VOL_SHAPE, BATCH_SIZE, ADNI_FLUID_CSV, SEED
+from .config_relu import BASE_DIR, VOL_SHAPE, BATCH_SIZE, ADNI_FLUID_CSV, SEED
 
 # ── FreeSurfer atlas ID → column name prefix ──────────────────────────────────
 _ATLAS = {
@@ -177,13 +178,12 @@ def _build_rid_to_ptau(fluid_csv):
 
 
 def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
-                      batch_size=BATCH_SIZE, seed=SEED, use_mask=False,
-                      train_frac=0.70, val_frac=0.10):
+                      batch_size=BATCH_SIZE, seed=SEED, use_dk_mask=True):
     """
-    mode      : must be 'combined'
-    train_frac: fraction of subjects for training (default 0.70)
-    val_frac  : fraction of subjects for validation (default 0.10); test absorbs remainder
-    cond      : (87,) = [atrophy z-scores (86) ‖ ptau217 (1)]
+    mode  : must be 'combined'
+    Split : 70% train / 10% val / 20% test.
+    cond  : (87,) = [atrophy z-scores (86) ‖ ptau217 (1)]
+    use_dk_mask : if True, mask volumes to 86 DK atlas regions; if False, no masking.
     Returns: train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
     """
     if mode != "combined":
@@ -226,15 +226,13 @@ def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
     cond_vals = [cond_vals[i] for i in indices]
 
     n       = len(pet_paths)
-    train_n = int(train_frac * n)
-    val_n   = int(val_frac * n)
+    train_n = int(0.70 * n)
+    val_n   = int(0.10 * n)
 
-    train_ds = TauPETDataset(pet_paths[:train_n],              mri_paths[:train_n],              cond_vals[:train_n],              use_dk_mask=use_mask)
-    val_ds   = TauPETDataset(pet_paths[train_n:train_n+val_n], mri_paths[train_n:train_n+val_n], cond_vals[train_n:train_n+val_n], use_dk_mask=use_mask)
-    test_ds  = TauPETDataset(pet_paths[train_n+val_n:],        mri_paths[train_n+val_n:],        cond_vals[train_n+val_n:],        use_dk_mask=use_mask)
-    test_frac = round(1.0 - train_frac - val_frac, 2)
-    print(f"Split ({int(train_frac*100)}/{int(val_frac*100)}/{int(test_frac*100)}): "
-          f"{len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
+    train_ds = TauPETDataset(pet_paths[:train_n],              mri_paths[:train_n],              cond_vals[:train_n],              use_dk_mask=use_dk_mask)
+    val_ds   = TauPETDataset(pet_paths[train_n:train_n+val_n], mri_paths[train_n:train_n+val_n], cond_vals[train_n:train_n+val_n], use_dk_mask=use_dk_mask)
+    test_ds  = TauPETDataset(pet_paths[train_n+val_n:],        mri_paths[train_n+val_n:],        cond_vals[train_n+val_n:],        use_dk_mask=use_dk_mask)
+    print(f"Split (70/10/20): {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)

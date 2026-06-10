@@ -10,6 +10,8 @@ from src.config import DEVICE, VOL_SHAPE, FIGURES_DIR
 from src.dataset import build_dataloaders
 from src import dataset_v2 as _dataset_v2
 from src import dataset_combined as _dataset_combined
+from src import dataset_v2_relu as _dataset_v2_relu
+from src import dataset_combined_relu as _dataset_combined_relu
 from src.diffusion import DiffusionSchedule
 from src.inference import load_models, synthesize_tau_pet, synthesize_no_mri
 
@@ -201,7 +203,7 @@ def run_multi_subject_metrics(ae, unet, schedule, encode_cond, latent_std, test_
         mse_i = float(np.mean((gen - real) ** 2))
         maes.append(float(np.mean(np.abs(gen - real))))
         mses.append(mse_i)
-        nrmses.append(float(abs(real.mean() - gen.mean()) / (real.mean() + 1e-8)))
+        nrmses.append(float(np.sqrt(np.mean((gen - real) ** 2)) / (real.mean() + 1e-8)))
         psnrs.append(10.0 * np.log10(1.0 / mse_i) if mse_i > 0 else float('inf'))
         ssims.append(float(ssim(real, gen, data_range=1.0)))
 
@@ -338,6 +340,8 @@ if __name__ == "__main__":
                         "Auto-detected from --checkpoint-dir if not set.")
     p.add_argument("--use-mask", action="store_true", default=False,
                    help="Apply gray-matter brain mask (T1_seg label==2) to MRI and PET volumes")
+    p.add_argument("--arch", choices=["silu", "relu"], default="silu",
+                   help="Model architecture variant: 'silu' (default) or 'relu'")
     args = p.parse_args()
 
     COND_MODE = args.mode
@@ -362,17 +366,25 @@ if __name__ == "__main__":
     print(f"Figures → {FIG_DIR}")
 
     # ── dataset ───────────────────────────────────────────────────────────────
-    if args.mode == "combined":
-        _build = _dataset_combined.build_dataloaders
-    elif args.checkpoint_dir and args.checkpoint_dir.rstrip("/").endswith("_v2"):
-        _build = _dataset_v2.build_dataloaders
+    if args.arch == "relu":
+        if args.mode == "combined":
+            train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = \
+                _dataset_combined_relu.build_dataloaders(mode=COND_MODE, use_dk_mask=args.use_mask)
+        else:
+            train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = \
+                _dataset_v2_relu.build_dataloaders(mode=COND_MODE, use_dk_mask=args.use_mask)
     else:
-        _build = build_dataloaders
-    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = _build(
-        mode=COND_MODE, use_mask=args.use_mask
-    )
+        if args.mode == "combined":
+            _build = _dataset_combined.build_dataloaders
+        elif args.checkpoint_dir and args.checkpoint_dir.rstrip("/").endswith("_v2"):
+            _build = _dataset_v2.build_dataloaders
+        else:
+            _build = build_dataloaders
+        train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = _build(
+            mode=COND_MODE, use_mask=args.use_mask
+        )
 
-    ae, unet, conditioner, latent_std, diff_losses = load_models(CKPT_PATH, COND_MODE)
+    ae, unet, conditioner, latent_std, diff_losses = load_models(CKPT_PATH, COND_MODE, arch=args.arch)
     encode_cond = conditioner.encode
     schedule    = DiffusionSchedule()
     print(f"latent_std per channel: {latent_std.squeeze().tolist()}")

@@ -1,7 +1,7 @@
 import torch
 from tqdm import tqdm
 
-from .config import DEVICE, T_STEPS, DIFF_CHECKPOINT_PATH, AE_CHECKPOINT_PATH
+from .config import DEVICE, T_STEPS, DIFF_CHECKPOINT_PATH, AE_CHECKPOINT_PATH, LATENT_CH
 from .diffusion import DiffusionSchedule
 from .models import Autoencoder3D, DenoisingUNet3D
 from .conditioning import build_conditioner
@@ -29,17 +29,22 @@ def _remap_unet_keys(state_dict):
     return new_sd
 
 
-def load_models(checkpoint_path, mode, device=DEVICE):
+def load_models(checkpoint_path, mode, device=DEVICE, arch='silu'):
     """Load ae, unet, conditioner, and latent_std from a checkpoint.
 
     checkpoint_path : path to the diffusion checkpoint
     mode            : 'atrophy' or 'ptau217'
+    arch            : 'silu' (default) or 'relu' — must match the checkpoint's training variant
     Returns         : (ae, unet, conditioner, latent_std, diff_losses)
 
     latent_std defaults to ones if absent (old checkpoints without scaling).
     """
-    ae          = Autoencoder3D().to(device)
-    unet        = DenoisingUNet3D().to(device)
+    if arch == 'relu':
+        from .models_relu import Autoencoder3D as _AE, DenoisingUNet3D as _UNet
+    else:
+        from .models import Autoencoder3D as _AE, DenoisingUNet3D as _UNet
+    ae          = _AE().to(device)
+    unet        = _UNet().to(device)
     conditioner = build_conditioner(mode, device=device)
 
     ckpt = torch.load(checkpoint_path, map_location=device)
@@ -49,7 +54,7 @@ def load_models(checkpoint_path, mode, device=DEVICE):
         conditioner.load_state_dict(ckpt["conditioner"])
 
     # latent_std: (1, LATENT_CH, 1, 1, 1) — ones for backwards-compat with old ckpts
-    latent_std  = ckpt.get("latent_std", torch.ones(1, 4, 1, 1, 1)).to(device)
+    latent_std  = ckpt.get("latent_std", torch.ones(1, LATENT_CH, 1, 1, 1)).to(device)
     diff_losses = ckpt.get("diff_losses", [])
     print(f"Loaded {mode} model: {len(diff_losses)} diffusion epochs")
     return ae, unet, conditioner, latent_std, diff_losses

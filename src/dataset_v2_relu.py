@@ -1,21 +1,34 @@
 """
-dataset_combined.py – ADNI dataset loader for combined atrophy + ptau217 conditioning.
+dataset_v2_relu.py – ADNI dataset loader with ReLU config (160×160×96 volume shape).
 
-mode='combined'
-    Conditioning data: 87-dim vector = [atrophy z-scores (86), ptau217 scalar (1)].
-    Only subjects with MRI, PET, atrophy z-scores, AND ptau217 values are included.
-    Split: 80 / 10 / 10  train / val / test.
+Changes from dataset.py:
+  - 70 / 10 / 20  train / val / test split.
+  - _load() caches (orig_min, orig_max) per sample so callers can convert
+    generated volumes back to SUVR space.  Use get_pet_norms(idx) +
+    unnormalize() for evaluation in real space.
+  - Uses config_relu with VOL_SHAPE = (96, 112, 96)
 
-Both conditioning signals are concatenated into a single (87,) tensor so the
-CombinedConditioner can split them back apart (first 86 = atrophy, last 1 = ptau).
+mode='ptau217'
+    Conditioning data: scalar plasma p-tau217 (pg/mL), shape (1,).
+    Subjects without a matched pT217_F value are excluded.
+    Source: ADNI34Tau_withFluidBiomarkers.csv  column  pT217_F
 
-Masking: Uses Desikan-Killiany (DK) atlas (86 regions) via RegionLabelMap.py.
-Only voxels within the 86 DK regions are retained; non-brain regions are masked out.
+mode='atrophy'
+    Conditioning data: 86-dim regional atrophy z-score vector, shape (86,).
+    Source: regional_atrophy_zscores.csv  columns CTX_LH_*/RIGHT_*/LEFT_*_ATROPHY_Z
+
+Both modes:
+    - Shuffle subjects before splitting so AD and MCI cohorts are mixed.
+    - Volumes are normalised per-subject to [0, 1] and resampled to VOL_SHAPE.
+    - Masked to Desikan-Killiany (DK) atlas (86 regions).
+    - MRI files: data/{1mm_parcellated_AD_subj,1mm_parcellated_MCI_subj}/*/T1_to_MNI_nonlin.nii.gz
+    - PET files: data/cerebellumNormalized_AD_MCI/{AD,MCI}/RID_*/PET_MNISpace_SUVR_CerebellumNorm.nii[.gz]
 """
 
 import os
 import glob
 import random
+import sys
 
 import numpy as np
 import torch
@@ -23,7 +36,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 
-from .config import BASE_DIR, VOL_SHAPE, BATCH_SIZE, ADNI_FLUID_CSV, SEED
+from .config_relu import BASE_DIR, VOL_SHAPE, BATCH_SIZE, ADNI_FLUID_CSV, SEED
 
 # ── FreeSurfer atlas ID → column name prefix ──────────────────────────────────
 _ATLAS = {
@@ -74,22 +87,32 @@ _ATLAS = {
 REGION_COLS = [f"{_ATLAS[i]}_ATROPHY_Z" for i in range(1, 87)]
 
 
+# ── Normalization helpers ─────────────────────────────────────────────────────
+
+def unnormalize(vol_norm, orig_min, orig_max):
+    """Invert per-subject min-max normalization to recover SUVR values."""
+    return vol_norm * (orig_max - orig_min + 1e-8) + orig_min
+
+
 # ── Dataset class ─────────────────────────────────────────────────────────────
 
 class TauPETDataset(Dataset):
     """
     Returns (pet, mri, cond_data) where:
       pet, mri   – (1, H, W, D) float tensor normalised to [0, 1]
-      cond_data  – (87,) = [atrophy z-scores (86) ‖ ptau217 scalar (1)]
+      cond_data  – (1,)  scalar p-tau217  [ptau217 mode]
+                   (86,) atrophy z-scores [atrophy  mode]
 
-    Volumes are masked to include only the 86 Desikan-Killiany atlas regions.
+    Call get_pet_norms(idx) to retrieve the (orig_min, orig_max) for subject
+    idx, which can then be passed to unnormalize() to recover SUVR values.
     """
 
     def __init__(self, pet_paths, mri_paths, cond_values, use_dk_mask=True):
         self.pet_paths   = pet_paths
         self.mri_paths   = mri_paths
-        self.cond_values = cond_values
+        self.cond_values = cond_values  # list of np.ndarray or float
         self.use_dk_mask = use_dk_mask
+        self._pet_norms  = {}           # idx -> (orig_min, orig_max), populated lazily
         self._mask_cache = {}
 
     def _get_dk_mask(self, idx):
@@ -117,16 +140,26 @@ class TauPETDataset(Dataset):
         ).squeeze(0)
         if mask is not None:
             vol = vol * mask
-        vmin, vmax = vol.min(), vol.max()
-        return (vol - vmin) / (vmax - vmin + 1e-8)
+        orig_min = float(vol.min())
+        orig_max = float(vol.max())
+        return (vol - orig_min) / (orig_max - orig_min + 1e-8), orig_min, orig_max
+
+    def get_pet_norms(self, idx):
+        """Return (orig_min, orig_max) in SUVR for the PET volume at idx."""
+        if idx not in self._pet_norms:
+            import nibabel as nib
+            vol = nib.load(self.pet_paths[idx]).get_fdata().astype(np.float32)
+            self._pet_norms[idx] = (float(vol.min()), float(vol.max()))
+        return self._pet_norms[idx]
 
     def __len__(self):
         return len(self.pet_paths)
 
     def __getitem__(self, idx):
         mask = self._get_dk_mask(idx) if self.use_dk_mask else None
-        pet  = self._load(self.pet_paths[idx], mask=mask)
-        mri  = self._load(self.mri_paths[idx], mask=mask)
+        pet, pet_min, pet_max = self._load(self.pet_paths[idx], mask=mask)
+        self._pet_norms[idx]  = (pet_min, pet_max)
+        mri, _, _             = self._load(self.mri_paths[idx], mask=mask)
         cond = torch.tensor(self.cond_values[idx], dtype=torch.float32)
         return pet, mri, cond
 
@@ -150,7 +183,8 @@ def _build_rid_to_atrophy(base_dir):
     if missing:
         raise ValueError(f"Atrophy CSV missing columns: {missing}")
     rid_to_atrophy = {}
-    skipped = duplicates = 0
+    skipped = 0
+    duplicates = 0
     for _, row in df.iterrows():
         rid = str(int(row["RID"]))
         vec = row[REGION_COLS].values.astype(np.float32)
@@ -176,25 +210,25 @@ def _build_rid_to_ptau(fluid_csv):
     }
 
 
-def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
-                      batch_size=BATCH_SIZE, seed=SEED, use_mask=False,
-                      train_frac=0.70, val_frac=0.10):
+def build_dataloaders(mode: str, base_dir=BASE_DIR, batch_size=BATCH_SIZE, seed=SEED,
+                      use_dk_mask=True):
     """
-    mode      : must be 'combined'
-    train_frac: fraction of subjects for training (default 0.70)
-    val_frac  : fraction of subjects for validation (default 0.10); test absorbs remainder
-    cond      : (87,) = [atrophy z-scores (86) ‖ ptau217 (1)]
+    mode  : 'ptau217' or 'atrophy'
+    Split : 70% train / 10% val / 20% test (was 80/10/10; 20% test gives ~37 samples with 187 total).
     Returns: train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
     """
-    if mode != "combined":
-        raise ValueError(f"dataset_combined only supports mode='combined', got {mode!r}")
+    if mode not in ("ptau217", "atrophy"):
+        raise ValueError(f"mode must be 'ptau217' or 'atrophy', got {mode!r}")
 
-    rid_to_mri     = _build_rid_to_mri(base_dir)
-    rid_to_atrophy = _build_rid_to_atrophy(base_dir)
-    rid_to_ptau    = _build_rid_to_ptau(ADNI_FLUID_CSV)
+    rid_to_mri = _build_rid_to_mri(base_dir)
     print(f"MRI subjects found: {len(rid_to_mri)}")
-    print(f"Atrophy vectors loaded: {len(rid_to_atrophy)}")
-    print(f"p-tau217 values loaded: {len(rid_to_ptau)}")
+
+    if mode == "atrophy":
+        rid_to_cond = _build_rid_to_atrophy(base_dir)
+        print(f"Atrophy vectors loaded: {len(rid_to_cond)}")
+    else:
+        rid_to_cond = _build_rid_to_ptau(ADNI_FLUID_CSV)
+        print(f"p-tau217 values loaded: {len(rid_to_cond)}")
 
     pet_paths, mri_paths, cond_vals = [], [], []
     for cohort in ["AD", "MCI"]:
@@ -207,17 +241,14 @@ def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
             pet = os.path.join(subj_dir, "PET_MNISpace_SUVR_CerebellumNorm.nii")
             if not os.path.exists(pet):
                 pet = pet + ".gz"
-            if (os.path.exists(pet) and rid in rid_to_mri
-                    and rid in rid_to_atrophy and rid in rid_to_ptau):
+            if os.path.exists(pet) and rid in rid_to_mri and rid in rid_to_cond:
                 pet_paths.append(pet)
                 mri_paths.append(rid_to_mri[rid])
-                # concatenate: (86,) atrophy + (1,) ptau → (87,)
-                cond_vals.append(
-                    np.concatenate([rid_to_atrophy[rid], rid_to_ptau[rid]])
-                )
+                cond_vals.append(rid_to_cond[rid])
 
-    print(f"Matched subjects (combined): {len(pet_paths)}")
+    print(f"Matched subjects ({mode}): {len(pet_paths)}")
 
+    # Shuffle before splitting so AD and MCI subjects are mixed in all sets
     rng = random.Random(seed)
     indices = list(range(len(pet_paths)))
     rng.shuffle(indices)
@@ -225,16 +256,16 @@ def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
     mri_paths = [mri_paths[i] for i in indices]
     cond_vals = [cond_vals[i] for i in indices]
 
+    # 70 / 10 / 20 split (was 80/10/10; with only ~187 samples a 10% test set is too small)
     n       = len(pet_paths)
-    train_n = int(train_frac * n)
-    val_n   = int(val_frac * n)
+    train_n = int(0.70 * n)
+    val_n   = int(0.10 * n)
+    # test_n absorbs rounding remainder (~20%)
 
-    train_ds = TauPETDataset(pet_paths[:train_n],              mri_paths[:train_n],              cond_vals[:train_n],              use_dk_mask=use_mask)
-    val_ds   = TauPETDataset(pet_paths[train_n:train_n+val_n], mri_paths[train_n:train_n+val_n], cond_vals[train_n:train_n+val_n], use_dk_mask=use_mask)
-    test_ds  = TauPETDataset(pet_paths[train_n+val_n:],        mri_paths[train_n+val_n:],        cond_vals[train_n+val_n:],        use_dk_mask=use_mask)
-    test_frac = round(1.0 - train_frac - val_frac, 2)
-    print(f"Split ({int(train_frac*100)}/{int(val_frac*100)}/{int(test_frac*100)}): "
-          f"{len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
+    train_ds = TauPETDataset(pet_paths[:train_n],              mri_paths[:train_n],              cond_vals[:train_n],              use_dk_mask=use_dk_mask)
+    val_ds   = TauPETDataset(pet_paths[train_n:train_n+val_n], mri_paths[train_n:train_n+val_n], cond_vals[train_n:train_n+val_n], use_dk_mask=use_dk_mask)
+    test_ds  = TauPETDataset(pet_paths[train_n+val_n:],        mri_paths[train_n+val_n:],        cond_vals[train_n+val_n:],        use_dk_mask=use_dk_mask)
+    print(f"Split (70/10/20): {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)
@@ -244,3 +275,17 @@ def build_dataloaders(mode: str = "combined", base_dir=BASE_DIR,
                               num_workers=2, pin_memory=True)
 
     return train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
+
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+
+    for mode in ("ptau217", "atrophy"):
+        print(f"\n=== mode={mode} ===")
+        train_ds, val_ds, test_ds, _, _, _ = build_dataloaders(mode)
+        pet, mri, cond = train_ds[0]
+        print(f"  PET  : {pet.shape}  range [{pet.min():.2f}, {pet.max():.2f}]")
+        print(f"  MRI  : {mri.shape}  range [{mri.min():.2f}, {mri.max():.2f}]")
+        print(f"  cond : {cond.shape}  sample {cond[:3].tolist()}")
+        orig_min, orig_max = train_ds.get_pet_norms(0)
+        print(f"  PET SUVR range (orig): [{orig_min:.3f}, {orig_max:.3f}]")

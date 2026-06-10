@@ -210,10 +210,11 @@ def _build_rid_to_ptau(fluid_csv):
 
 
 def build_dataloaders(mode: str, base_dir=BASE_DIR, batch_size=BATCH_SIZE, seed=SEED,
-                      use_dk_mask=True):
+                      use_dk_mask=True, train_frac=0.70, val_frac=0.10):
     """
-    mode  : 'ptau217' or 'atrophy'
-    Split : 70% train / 10% val / 20% test (was 80/10/10; 20% test gives ~37 samples with 187 total).
+    mode      : 'ptau217' or 'atrophy'
+    train_frac: fraction of subjects for training (default 0.70)
+    val_frac  : fraction of subjects for validation (default 0.10); test absorbs remainder
     Returns: train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
     """
     if mode not in ("ptau217", "atrophy"):
@@ -255,16 +256,17 @@ def build_dataloaders(mode: str, base_dir=BASE_DIR, batch_size=BATCH_SIZE, seed=
     mri_paths = [mri_paths[i] for i in indices]
     cond_vals = [cond_vals[i] for i in indices]
 
-    # 70 / 10 / 20 split (was 80/10/10; with only ~187 samples a 10% test set is too small)
     n       = len(pet_paths)
-    train_n = int(0.70 * n)
-    val_n   = int(0.10 * n)
-    # test_n absorbs rounding remainder (~20%)
+    train_n = int(train_frac * n)
+    val_n   = int(val_frac * n)
+    # test absorbs the rounding remainder
 
     train_ds = TauPETDataset(pet_paths[:train_n],              mri_paths[:train_n],              cond_vals[:train_n],              use_dk_mask=use_dk_mask)
     val_ds   = TauPETDataset(pet_paths[train_n:train_n+val_n], mri_paths[train_n:train_n+val_n], cond_vals[train_n:train_n+val_n], use_dk_mask=use_dk_mask)
     test_ds  = TauPETDataset(pet_paths[train_n+val_n:],        mri_paths[train_n+val_n:],        cond_vals[train_n+val_n:],        use_dk_mask=use_dk_mask)
-    print(f"Split (70/10/20): {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
+    test_frac = round(1.0 - train_frac - val_frac, 2)
+    print(f"Split ({int(train_frac*100)}/{int(val_frac*100)}/{int(test_frac*100)}): "
+          f"{len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                               num_workers=2, pin_memory=True)
