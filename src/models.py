@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import CLIPTextModel, CLIPTokenizer
 
-from .config import LATENT_CH, LATENT_SCALE, COND_DIM, DEVICE, CLIP_MODEL_PATH
+from .config import LATENT_CH, LATENT_SCALE, COND_DIM, DEVICE, CLIP_MODEL_PATH, GROUPNORM_GROUPS
 
 
 # ── 3D Autoencoder ────────────────────────────────────────────────────────────
@@ -14,65 +14,71 @@ from .config import LATENT_CH, LATENT_SCALE, COND_DIM, DEVICE, CLIP_MODEL_PATH
 
 class ResBlock3D(nn.Module):
     # residual block: two conv layers with a skip connection
+    # GroupNorm groups: 32 (was 8; paper specifies 32, ε=1e-6)
     def __init__(self, ch):
         super().__init__()
         self.net = nn.Sequential(
-            nn.GroupNorm(8, ch), nn.SiLU(),
+            nn.GroupNorm(GROUPNORM_GROUPS, ch, eps=1e-6), nn.SiLU(),
             nn.Conv3d(ch, ch, 3, padding=1),
-            nn.GroupNorm(8, ch), nn.SiLU(),
+            nn.GroupNorm(GROUPNORM_GROUPS, ch, eps=1e-6), nn.SiLU(),
             nn.Conv3d(ch, ch, 3, padding=1),
         )
     def forward(self, x): return x + self.net(x)
-# ResBlock3D - two conv layers with GroupNorm and SiLu, plus a skip connection.
-# GroupNorm is used because batch sizes are too small for BatchNorm to work reliably
 
 
 class Encoder3D(nn.Module):
-    # compresses a 3d volume into a compact latent rep
-    # channel progression: 1 --> 32 --> 64 --> 128 --> latent_ch * 2
-    def __init__(self, in_ch=1, base_ch=32, latent_ch=LATENT_CH, scale=LATENT_SCALE):
+    # channel progression: 1 → ch_mult[0] → ch_mult[1] → ch_mult[2] → latent_ch * 2
+    # ch_mult=(64, 128, 128) matches paper's [64, 128, 128, 128] adapted to 3 levels
+    # (was base_ch=32 with doubling: [32, 64, 128, 256])
+    def __init__(self, in_ch=1, ch_mult=(64, 128, 128), latent_ch=LATENT_CH, scale=LATENT_SCALE):
         super().__init__()
+        n_down = int(math.log2(scale))  # 3 for scale=8
+        assert len(ch_mult) == n_down, f"ch_mult must have {n_down} entries for scale={scale}"
 
-        n_down = int(math.log2(scale))  # number of downsampling stages
-        # conv lifts from 1 to 32 channels
-        # kernel size 3, padding = 1 to keep spatial dims unchanged
-        layers = [nn.Conv3d(in_ch, base_ch, 3, padding=1)]
-        ch = base_ch  # track current channel count
+        # Initial projection: 1 → ch_mult[0]
+        layers = [nn.Conv3d(in_ch, ch_mult[0], 3, padding=1)]
 
-        for _ in range(n_down):
-            layers += [ResBlock3D(ch), nn.Conv3d(ch, ch * 2, 4, stride=2, padding=1)]
-            ch *= 2
-        layers += [ResBlock3D(ch), nn.GroupNorm(8, ch), nn.SiLU(),
+        # Downsampling stages: ResBlock at current channels, then stride-2 conv to next
+        for i in range(n_down):
+            ch      = ch_mult[i]
+            ch_next = ch_mult[i + 1] if i + 1 < n_down else ch  # last stage stays at ch_mult[-1]
+            layers += [ResBlock3D(ch), nn.Conv3d(ch, ch_next, 4, stride=2, padding=1)]
+
+        # Final: ResBlock + GroupNorm + SiLU + 1×1 conv to latent mean/logvar
+        ch = ch_mult[-1]
+        layers += [ResBlock3D(ch), nn.GroupNorm(GROUPNORM_GROUPS, ch, eps=1e-6), nn.SiLU(),
                    nn.Conv3d(ch, latent_ch * 2, 1)]
         self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         h = self.net(x)
-        # split 8 channels into two 4-channel tensors: mean and logvar
-        # these parametrize the latent Gaussian distribution
         mean, logvar = h.chunk(2, dim=1)
         return mean, logvar
-# Encoder3D
-# starts at 1 channel, lifts to 32, then 3 downsampling stages doubling channels
-# each time while halving spatial dimensions
 
 
 class Decoder3D(nn.Module):
-    # mirror of the encoder, reconstructs volume from latent
-    # channel progression: latent_ch --> .... --> 1
-    def __init__(self, latent_ch=LATENT_CH, base_ch=32, out_ch=1, scale=LATENT_SCALE):
+    # mirror of Encoder3D; channel progression: latent_ch → ch_mult_rev → 1
+    # (was base_ch=32 with reverse-doubling starting from 256)
+    def __init__(self, latent_ch=LATENT_CH, ch_mult=(64, 128, 128), out_ch=1, scale=LATENT_SCALE):
         super().__init__()
-        n_up = int(math.log2(scale))
-        ch = base_ch * (2 ** n_up)
-        layers = [nn.Conv3d(latent_ch, ch, 3, padding=1), ResBlock3D(ch)]
-        for _ in range(n_up):
-            layers += [nn.ConvTranspose3d(ch, ch // 2, 4, stride=2, padding=1), ResBlock3D(ch // 2)]
-            ch //= 2
-        layers += [nn.GroupNorm(8, ch), nn.SiLU(), nn.Conv3d(ch, out_ch, 3, padding=1), nn.Sigmoid()]
+        n_up = int(math.log2(scale))  # 3
+        ch_rev = list(reversed(ch_mult))  # (128, 128, 64)
+
+        # Input projection from latent to highest channel count
+        layers = [nn.Conv3d(latent_ch, ch_rev[0], 3, padding=1), ResBlock3D(ch_rev[0])]
+
+        # Upsampling stages: stride-2 ConvTranspose, then ResBlock
+        for i in range(n_up):
+            ch      = ch_rev[i]
+            ch_next = ch_rev[i + 1] if i + 1 < n_up else ch_rev[-1]
+            layers += [nn.ConvTranspose3d(ch, ch_next, 4, stride=2, padding=1), ResBlock3D(ch_next)]
+
+        ch_final = ch_rev[-1]  # 64
+        layers += [nn.GroupNorm(GROUPNORM_GROUPS, ch_final, eps=1e-6), nn.SiLU(),
+                   nn.Conv3d(ch_final, out_ch, 3, padding=1), nn.Sigmoid()]
         self.net = nn.Sequential(*layers)
 
     def forward(self, z): return self.net(z)
-# starts at 256 channels and uses ConvTranspose3d to upsample back to original resolution
 
 
 class Autoencoder3D(nn.Module):
@@ -113,7 +119,7 @@ class Autoencoder3D(nn.Module):
 
 class CrossAttention3D(nn.Module):
     """Spatial-token × context cross-attention (Eq. 8–12)."""
-    def __init__(self, feat_dim, context_dim=COND_DIM, n_heads=4):
+    def __init__(self, feat_dim, context_dim=COND_DIM, n_heads=8):
         super().__init__()
         self.n_heads = n_heads
         self.d_head  = feat_dim // n_heads
@@ -144,6 +150,62 @@ class CrossAttention3D(nn.Module):
         return (x_flat + O).permute(0, 2, 1).view(B, C, H, W, D)
 
 
+class SelfAttention3D(nn.Module):
+    """Multi-head self-attention over flattened spatial tokens (Fig. 2)."""
+    def __init__(self, ch, n_heads=8):
+        super().__init__()
+        self.n_heads = n_heads
+        self.d_head  = ch // n_heads
+        self.scale   = self.d_head ** -0.5
+        self.norm    = nn.LayerNorm(ch)
+        self.to_qkv  = nn.Linear(ch, ch * 3, bias=False)
+        self.to_out  = nn.Linear(ch, ch)
+
+    def forward(self, x):
+        B, C, H, W, D = x.shape
+        N = H * W * D
+        x_flat = x.view(B, C, N).permute(0, 2, 1)  # (B, N, C)
+        x_norm = self.norm(x_flat)
+
+        qkv = self.to_qkv(x_norm).chunk(3, dim=-1)
+        Q, K, V = [t.view(B, N, self.n_heads, self.d_head).transpose(1, 2) for t in qkv]
+        A = torch.softmax(torch.matmul(Q, K.transpose(-2, -1)) * self.scale, dim=-1)
+        O = torch.matmul(A, V).transpose(1, 2).contiguous().view(B, N, C)
+        O = self.to_out(O)
+        return (x_flat + O).permute(0, 2, 1).view(B, C, H, W, D)
+
+
+class FeedForward3D(nn.Module):
+    """Position-wise feed-forward network over spatial tokens (Fig. 2)."""
+    def __init__(self, ch, mult=4):
+        super().__init__()
+        self.norm = nn.LayerNorm(ch)
+        self.net  = nn.Sequential(
+            nn.Linear(ch, ch * mult), nn.SiLU(), nn.Linear(ch * mult, ch)
+        )
+
+    def forward(self, x):
+        B, C, H, W, D = x.shape
+        N = H * W * D
+        x_flat = x.view(B, C, N).permute(0, 2, 1)  # (B, N, C)
+        return (x_flat + self.net(self.norm(x_flat))).permute(0, 2, 1).view(B, C, H, W, D)
+
+
+class TransformerBlock3D(nn.Module):
+    """Self-attn + cross-attn + FFN — one transformer block from paper Fig. 2."""
+    def __init__(self, ch, context_dim=COND_DIM, n_heads=8):
+        super().__init__()
+        self.sa  = SelfAttention3D(ch, n_heads)
+        self.ca  = CrossAttention3D(ch, context_dim, n_heads)
+        self.ffn = FeedForward3D(ch)
+
+    def forward(self, x, ctx):
+        x = self.sa(x)
+        x = self.ca(x, ctx)
+        x = self.ffn(x)
+        return x
+
+
 class TimestepEmbedding(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -159,62 +221,147 @@ class TimestepEmbedding(nn.Module):
 
 
 class UNetBlock3D(nn.Module):
-    def __init__(self, in_ch, out_ch, t_dim, context_dim=COND_DIM, use_attn=True):
+    """(ResBlock + 3×TransformerBlock) × 2 — paper Fig. 2 encoder/decoder block.
+
+    Two residual blocks each followed by three transformer blocks (self-attn +
+    cross-attn + FFN), giving six cross-attention layers per UNet level.
+    Channel mismatch (in_ch → out_ch) is handled in the first ResBlock's skip conv.
+    At the bottom of the block (paper Fig. 2), optional downsample/upsample is applied.
+    Returns (skip, out): skip = pre-downsample/upsample (for skip connections),
+                        out  = post-downsample/upsample (passed to next level)
+    (was: 2 conv layers + 1 cross-attention block)
+    """
+    def __init__(self, in_ch, out_ch, t_dim, context_dim=COND_DIM, n_transformer=3,
+                 downsample_ch=None, upsample_ch=None, upsample_in_ch=None):
         super().__init__()
-        self.norm1  = nn.GroupNorm(8, in_ch)
-        self.conv1  = nn.Conv3d(in_ch, out_ch, 3, padding=1)
-        self.t_proj = nn.Linear(t_dim, out_ch)
-        self.norm2  = nn.GroupNorm(8, out_ch)
-        self.conv2  = nn.Conv3d(out_ch, out_ch, 3, padding=1)
-        self.skip   = nn.Conv3d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
-        self.attn   = CrossAttention3D(out_ch, context_dim=context_dim) if use_attn else None
+        # First ResBlock (handles channel change via skip)
+        # eps=1e-6 per paper spec (PyTorch default was 1e-5)
+        self.norm1   = nn.GroupNorm(GROUPNORM_GROUPS, in_ch, eps=1e-6)
+        self.conv1   = nn.Conv3d(in_ch, out_ch, 3, padding=1)
+        self.t_proj1 = nn.Linear(t_dim, out_ch)
+        self.norm2   = nn.GroupNorm(GROUPNORM_GROUPS, out_ch, eps=1e-6)
+        self.conv2   = nn.Conv3d(out_ch, out_ch, 3, padding=1)
+        self.skip1   = nn.Conv3d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        # Three transformer blocks after first ResBlock
+        self.trans1  = nn.ModuleList([
+            TransformerBlock3D(out_ch, context_dim) for _ in range(n_transformer)
+        ])
+        # Second ResBlock (same channels: out_ch → out_ch)
+        self.norm3   = nn.GroupNorm(GROUPNORM_GROUPS, out_ch, eps=1e-6)
+        self.conv3   = nn.Conv3d(out_ch, out_ch, 3, padding=1)
+        self.t_proj2 = nn.Linear(t_dim, out_ch)
+        self.norm4   = nn.GroupNorm(GROUPNORM_GROUPS, out_ch, eps=1e-6)
+        self.conv4   = nn.Conv3d(out_ch, out_ch, 3, padding=1)
+        # Three transformer blocks after second ResBlock
+        self.trans2  = nn.ModuleList([
+            TransformerBlock3D(out_ch, context_dim) for _ in range(n_transformer)
+        ])
+        # At the bottom of the block (paper Fig. 2)
+        self.downsample = nn.Conv3d(out_ch, downsample_ch, 4, stride=2, padding=1) \
+                          if downsample_ch is not None else None
+        # upsample_in_ch: when set, upsample operates on the first upsample_in_ch
+        # channels of the block INPUT (x) rather than the block output (h).
+        # This matches the training configuration for dec2, where the upsample
+        # was applied to up3 (768ch) passed in as the first part of the cat input.
+        _up_in = upsample_in_ch if upsample_in_ch is not None else out_ch
+        self.upsample        = nn.ConvTranspose3d(_up_in, upsample_ch, 4, stride=2, padding=1) \
+                               if upsample_ch is not None else None
+        self._upsample_in_ch = upsample_in_ch  # None → apply to h; int → apply to x[:, :n]
 
     def forward(self, x, t_emb, ctx):
-        h = self.conv1(F.silu(self.norm1(x)))
-        h = h + self.t_proj(F.silu(t_emb))[:, :, None, None, None]
-        h = self.conv2(F.silu(self.norm2(h))) + self.skip(x)
-        if self.attn is not None:
-            h = self.attn(h, ctx)
-        return h
+        # First ResBlock
+        h  = self.conv1(F.silu(self.norm1(x)))
+        h  = h + self.t_proj1(F.silu(t_emb))[:, :, None, None, None]
+        h  = self.conv2(F.silu(self.norm2(h))) + self.skip1(x)
+        for blk in self.trans1:
+            h = blk(h, ctx)
+        # Second ResBlock
+        r  = self.conv3(F.silu(self.norm3(h)))
+        r  = r + self.t_proj2(F.silu(t_emb))[:, :, None, None, None]
+        h  = h + self.conv4(F.silu(self.norm4(r)))
+        for blk in self.trans2:
+            h = blk(h, ctx)
+        # h is now the skip output (pre-downsample/upsample)
+        skip = h
+        # Apply spatial resolution change at the bottom
+        if self.downsample is not None:
+            return skip, self.downsample(h)
+        if self.upsample is not None:
+            if self._upsample_in_ch is not None:
+                return skip, self.upsample(x[:, :self._upsample_in_ch])
+            return skip, self.upsample(h)
+        return skip, h  # bottleneck — no spatial change
 
 
 class DenoisingUNet3D(nn.Module):
     """Text-guided denoising U-Net (paper §II-D).
-    Input : h_t = cat(z_t, z_m)  shape (B, 2*LATENT_CH, lH, lW, lD)
+
+    3 resolution levels, channel widths [256, 512, 768], 2 residual blocks +
+    6 transformer blocks per level.  (was: 2 levels [64, 128, 256], 1 attn/level)
+    Downsample/upsample operations are now inside each UNetBlock3D at the bottom,
+    matching paper Fig. 2 specification.
+
+    Input : h_t = cat(z_t, z_m)  shape (B, LATENT_CH*2, lH, lW, lD)
     Output: predicted noise        shape (B,   LATENT_CH, lH, lW, lD)
     context_dim must match the output dimension of the conditioner used.
     """
-    def __init__(self, in_ch=LATENT_CH * 2, base_ch=64, t_dim=256, context_dim=COND_DIM):
+    def __init__(self, in_ch=LATENT_CH * 2, ch_list=(256, 512, 768),
+                 t_dim=256, context_dim=COND_DIM):
         super().__init__()
+        c1, c2, c3 = ch_list  # 256, 512, 768
+
         self.t_embed = TimestepEmbedding(t_dim)
-        self.in_conv = nn.Conv3d(in_ch, base_ch, 3, padding=1)
-        self.enc1    = UNetBlock3D(base_ch,     base_ch,     t_dim, context_dim)
-        self.down1   = nn.Conv3d(base_ch,       base_ch * 2, 4, stride=2, padding=1)
-        self.enc2    = UNetBlock3D(base_ch * 2, base_ch * 2, t_dim, context_dim)
-        self.down2   = nn.Conv3d(base_ch * 2,   base_ch * 4, 4, stride=2, padding=1)
-        self.mid     = UNetBlock3D(base_ch * 4, base_ch * 4, t_dim, context_dim)
-        self.up2     = nn.ConvTranspose3d(base_ch * 4, base_ch * 2, 4, stride=2, padding=1)
-        self.dec2    = UNetBlock3D(base_ch * 4, base_ch * 2, t_dim, context_dim)
-        self.up1     = nn.ConvTranspose3d(base_ch * 2, base_ch,     4, stride=2, padding=1)
-        self.dec1    = UNetBlock3D(base_ch * 2, base_ch,     t_dim, context_dim)
-        self.out     = nn.Sequential(
-            nn.GroupNorm(8, base_ch), nn.SiLU(), nn.Conv3d(base_ch, LATENT_CH, 1)
+        self.in_conv = nn.Conv3d(in_ch, c1, 3, padding=1)
+
+        # Encoder — downsample operations inside each block
+        self.enc1  = UNetBlock3D(c1, c1, t_dim, context_dim, downsample_ch=c2)
+        self.enc2  = UNetBlock3D(c2, c2, t_dim, context_dim, downsample_ch=c3)
+        self.enc3  = UNetBlock3D(c3, c3, t_dim, context_dim, downsample_ch=c3)
+
+        # Bottleneck — no spatial change
+        self.mid   = UNetBlock3D(c3, c3, t_dim, context_dim)
+
+        # Standalone upsampling chain from bottleneck (matches checkpoint up3/up2/up1):
+        #   up3: ConvTranspose(768→768) m@R4 → u3@R3
+        #   up2: ConvTranspose(768→512) u3@R3 → u2@R2
+        #   up1: ConvTranspose(512→256) u2@R2 → u1@R1
+        self.up3 = nn.ConvTranspose3d(c3, c3, 4, stride=2, padding=1)
+        self.up2 = nn.ConvTranspose3d(c3, c2, 4, stride=2, padding=1)
+        self.up1 = nn.ConvTranspose3d(c2, c1, 4, stride=2, padding=1)
+
+        # Decoder: each block takes cat([u_n, enc_skip]) — no internal upsample
+        #   dec3: cat([u3=768@R3, e3=768@R3]) = 1536 in → 768 out
+        #   dec2: cat([u2=512@R2, e2=512@R2]) = 1024 in → 512 out
+        #   dec1: cat([u1=256@R1, e1=256@R1]) =  512 in → 256 out
+        self.dec3  = UNetBlock3D(c3 * 2, c3, t_dim, context_dim)
+        self.dec2  = UNetBlock3D(c2 * 2, c2, t_dim, context_dim)
+        self.dec1  = UNetBlock3D(c1 * 2, c1, t_dim, context_dim)
+
+        self.out   = nn.Sequential(
+            nn.GroupNorm(GROUPNORM_GROUPS, c1, eps=1e-6), nn.SiLU(), nn.Conv3d(c1, LATENT_CH, 1)
         )
 
     def forward(self, ht, t, ctx):
         t_emb = self.t_embed(t)
         x  = self.in_conv(ht)
-        e1 = self.enc1(x,              t_emb, ctx)
-        e2 = self.enc2(self.down1(e1), t_emb, ctx)
-        m  = self.mid(self.down2(e2),  t_emb, ctx)
 
-        up2 = self.up2(m)
-        up2 = F.interpolate(up2, size=e2.shape[2:], mode='trilinear', align_corners=False)
-        d2  = self.dec2(torch.cat([up2, e2], dim=1), t_emb, ctx)
+        # Encoder: unpack (skip, downsampled_out) from each block
+        e1, x2 = self.enc1(x,  t_emb, ctx)   # e1=skip (pre-downsample), x2=downsampled
+        e2, x3 = self.enc2(x2, t_emb, ctx)   # e2=skip (pre-downsample), x3=downsampled
+        e3, xm = self.enc3(x3, t_emb, ctx)   # e3=skip (pre-downsample), xm=downsampled
 
-        up1 = self.up1(d2)
-        up1 = F.interpolate(up1, size=e1.shape[2:], mode='trilinear', align_corners=False)
-        d1  = self.dec1(torch.cat([up1, e1], dim=1), t_emb, ctx)
+        # Bottleneck
+        _, m = self.mid(xm, t_emb, ctx)      # skip unused at bottleneck
+
+        # Standalone upsample chain from bottleneck (up3→up2→up1)
+        u3 = F.interpolate(self.up3(m),  size=e3.shape[2:], mode='trilinear', align_corners=False)
+        u2 = F.interpolate(self.up2(u3), size=e2.shape[2:], mode='trilinear', align_corners=False)
+        u1 = F.interpolate(self.up1(u2), size=e1.shape[2:], mode='trilinear', align_corners=False)
+
+        # Decoder with encoder skip connections
+        _, d3 = self.dec3(torch.cat([u3, e3], dim=1), t_emb, ctx)
+        _, d2 = self.dec2(torch.cat([u2, e2], dim=1), t_emb, ctx)
+        _, d1 = self.dec1(torch.cat([u1, e1], dim=1), t_emb, ctx)
 
         return self.out(d1)
 

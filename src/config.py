@@ -19,7 +19,7 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 # Paper used (160, 160, 96) which crops ~47% of the Z axis; kept as a comment
 # for reference: VOL_SHAPE = (160, 160, 96)
 VOL_SHAPE    = (96, 112, 96)
-LATENT_CH    = 4
+LATENT_CH    = 3      # was 4 (pre-paper-alignment; paper specifies 3-channel latent)
 LATENT_SCALE = 8              # spatial downscale factor of autoencoder
 
 LAT_H = VOL_SHAPE[0] // LATENT_SCALE
@@ -28,8 +28,9 @@ LAT_D = VOL_SHAPE[2] // LATENT_SCALE
 
 # Diffusion
 T_STEPS    = 1000
-BETA_START = 1e-4   # values used in DDPM paper
-BETA_END   = 0.02
+BETA_START = 0.0015  # was 1e-4; paper uses scaled linear schedule (0.0015 → 0.0205)
+BETA_END   = 0.0205  # was 0.02
+GROUPNORM_GROUPS = 32  # was hardcoded 8 in models.py; paper specifies 32 groups, ε=1e-6
 
 # Training  (paper: batch=8, epochs=600 on A100)
 AE_EPOCHS   = 100

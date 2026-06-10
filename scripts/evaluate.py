@@ -8,6 +8,8 @@ from skimage.metrics import structural_similarity as ssim
 
 from src.config import DEVICE, VOL_SHAPE, FIGURES_DIR
 from src.dataset import build_dataloaders
+from src import dataset_v2 as _dataset_v2
+from src import dataset_combined as _dataset_combined
 from src.diffusion import DiffusionSchedule
 from src.inference import load_models, synthesize_tau_pet, synthesize_no_mri
 
@@ -187,23 +189,28 @@ def run_mri_ablation_visual(ae, unet, schedule, encode_cond, latent_std, test_ds
 
 
 def run_multi_subject_metrics(ae, unet, schedule, encode_cond, latent_std, test_ds,
-                               device=DEVICE, n_subjects=10, n_steps=500):
-    """Compute MAE/MSE/SSIM over multiple test subjects."""
-    maes, mses, ssims = [], [], []
-    for i in range(min(n_subjects, len(test_ds))):
+                               device=DEVICE, n_steps=500):
+    """Compute per-subject MAE/MSE/NRMSE/PSNR/SSIM over all test subjects."""
+    maes, mses, nrmses, psnrs, ssims = [], [], [], [], []
+    for i in range(len(test_ds)):
         pet, mri, atrophy = test_ds[i]
         real = pet.squeeze().numpy()
         gen  = synthesize_tau_pet(mri.unsqueeze(0), atrophy, ae, unet, schedule,
                                   encode_cond, latent_std, device=device,
                                   n_steps=n_steps, sampler='ddpm').squeeze().numpy()
-        maes.append(np.mean(np.abs(gen - real)))
-        mses.append(np.mean((gen - real) ** 2))
-        ssims.append(ssim(real, gen, data_range=1.0))
+        mse_i = float(np.mean((gen - real) ** 2))
+        maes.append(float(np.mean(np.abs(gen - real))))
+        mses.append(mse_i)
+        nrmses.append(float(abs(real.mean() - gen.mean()) / (real.mean() + 1e-8)))
+        psnrs.append(10.0 * np.log10(1.0 / mse_i) if mse_i > 0 else float('inf'))
+        ssims.append(float(ssim(real, gen, data_range=1.0)))
 
-    print(f"Mean MAE:  {np.mean(maes):.4f} ± {np.std(maes):.4f}")
-    print(f"Mean MSE:  {np.mean(mses):.4f} ± {np.std(mses):.4f}")
-    print(f"Mean SSIM: {np.mean(ssims):.4f} ± {np.std(ssims):.4f}")
-    return maes, mses, ssims
+    print(f"Mean MAE:   {np.mean(maes):.4f} ± {np.std(maes):.4f}")
+    print(f"Mean MSE:   {np.mean(mses):.4f} ± {np.std(mses):.4f}")
+    print(f"Mean NRMSE: {np.mean(nrmses):.4f} ± {np.std(nrmses):.4f}")
+    print(f"Mean PSNR:  {np.mean(psnrs):.2f} ± {np.std(psnrs):.2f} dB")
+    print(f"Mean SSIM:  {np.mean(ssims):.4f} ± {np.std(ssims):.4f}")
+    return maes, mses, nrmses, psnrs, ssims
 
 
 def run_roi_mse_eval(ae, unet, schedule, encode_cond, latent_std, test_loader,
@@ -273,50 +280,138 @@ def run_ablation_study(ae, unet, schedule, encode_cond, latent_std, test_loader,
     return ablation
 
 
+def plot_multi_subject_ssim(ssims, mode, save_path):
+    """Bar chart of per-subject SSIM across the test set."""
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.bar(range(len(ssims)), ssims, color="steelblue")
+    ax.axhline(np.mean(ssims), color="red", linestyle="--",
+               label=f"Mean = {np.mean(ssims):.3f} ± {np.std(ssims):.3f}")
+    ax.set_xlabel("Test subject index")
+    ax.set_ylabel("SSIM")
+    ax.set_title(f"Per-subject SSIM — {mode} mode")
+    ax.set_ylim(0, 1)
+    ax.legend()
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+
+def plot_roi_heatmap(mse_table, mode, save_path):
+    """Heatmap of region-wise MSE table."""
+    fig, ax = plt.subplots(figsize=(11, 2))
+    data = mse_table.values.astype(float)
+    im = ax.imshow(data, cmap="YlOrRd", aspect="auto")
+    ax.set_xticks(range(len(mse_table.columns)))
+    ax.set_xticklabels(mse_table.columns, rotation=30, ha="right", fontsize=9)
+    ax.set_yticks(range(len(mse_table.index)))
+    ax.set_yticklabels(mse_table.index, fontsize=9)
+    for i in range(data.shape[0]):
+        for j in range(data.shape[1]):
+            ax.text(j, i, f"{data[i,j]:.4f}", ha="center", va="center", fontsize=7)
+    plt.colorbar(im, ax=ax, label="MSE")
+    ax.set_title(f"Region-wise MSE — {mode} mode")
+    plt.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+# ── checkpoint-dir → figures subdirectory mapping ─────────────────────────────
+_DIR_TO_SUBPATH = {
+    "atrophy":    os.path.join("atrophy",  "72split"),
+    "ptau217":    os.path.join("ptau217",  "72split"),
+    "atrophy_v2": os.path.join("atrophy",  "80split"),
+    "ptau217_v2": os.path.join("ptau217",  "80split"),
+    "combined":   "atrophy_ptau217",
+}
+
+
 if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["atrophy", "ptau217"], default="atrophy")
+    p.add_argument("--mode", choices=["atrophy", "ptau217", "combined"], default="atrophy")
+    p.add_argument("--checkpoint-dir", type=str, default=None,
+                   help="Override default checkpoint directory.")
+    p.add_argument("--figures-dir", type=str, default=None,
+                   help="Override figures subdirectory (relative to results/figures/). "
+                        "Auto-detected from --checkpoint-dir if not set.")
+    p.add_argument("--use-mask", action="store_true", default=False,
+                   help="Apply gray-matter brain mask (T1_seg label==2) to MRI and PET volumes")
     args = p.parse_args()
 
     COND_MODE = args.mode
-    CKPT_PATH = f"results/checkpoints/{COND_MODE}/diff_{COND_MODE}.pt"
 
-    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = build_dataloaders(mode=COND_MODE)
+    # ── checkpoint path ────────────────────────────────────────────────────────
+    if args.checkpoint_dir:
+        CKPT_PATH = os.path.join(args.checkpoint_dir, f"diff_{COND_MODE}.pt")
+    else:
+        CKPT_PATH = f"results/checkpoints/{COND_MODE}/diff_{COND_MODE}.pt"
+
+    # ── figures output directory ───────────────────────────────────────────────
+    if args.figures_dir:
+        fig_subpath = args.figures_dir
+    elif args.checkpoint_dir:
+        key = os.path.basename(args.checkpoint_dir.rstrip("/"))
+        fig_subpath = _DIR_TO_SUBPATH.get(key, key)
+    else:
+        fig_subpath = _DIR_TO_SUBPATH.get(COND_MODE, COND_MODE)
+
+    FIG_DIR = os.path.join(FIGURES_DIR, fig_subpath)
+    os.makedirs(FIG_DIR, exist_ok=True)
+    print(f"Figures → {FIG_DIR}")
+
+    # ── dataset ───────────────────────────────────────────────────────────────
+    if args.mode == "combined":
+        _build = _dataset_combined.build_dataloaders
+    elif args.checkpoint_dir and args.checkpoint_dir.rstrip("/").endswith("_v2"):
+        _build = _dataset_v2.build_dataloaders
+    else:
+        _build = build_dataloaders
+    train_ds, val_ds, test_ds, train_loader, val_loader, test_loader = _build(
+        mode=COND_MODE, use_mask=args.use_mask
+    )
+
     ae, unet, conditioner, latent_std, diff_losses = load_models(CKPT_PATH, COND_MODE)
     encode_cond = conditioner.encode
     schedule    = DiffusionSchedule()
     print(f"latent_std per channel: {latent_std.squeeze().tolist()}")
 
-    # Loss curves
+    # Loss curve
     print(f"Final diffusion loss: {diff_losses[-1]:.6f}")
     plt.figure(figsize=(7, 3))
     plt.plot(diff_losses); plt.xlabel("Epoch"); plt.ylabel("MSE Loss")
-    plt.title(f"Diffusion Loss ({COND_MODE} mode)"); plt.tight_layout()
-    os.makedirs(FIGURES_DIR, exist_ok=True)
-    plt.savefig(f"{FIGURES_DIR}/diff_loss_{COND_MODE}.png", dpi=150)
-    plt.show()
+    plt.title(f"Diffusion Loss — {COND_MODE} mode"); plt.tight_layout()
+    plt.savefig(f"{FIG_DIR}/diff_loss_{COND_MODE}.png", dpi=150)
+    plt.close()
 
     # AE reconstruction quality
-    plot_ae_reconstruction(ae, test_ds)
+    plot_ae_reconstruction(ae, test_ds,
+                           save_path=f"{FIG_DIR}/ae_recon.png")
 
-    # Real vs generated comparison (3-view, metrics)
+    # Real vs generated comparison (3-view)
     compare_generated_vs_real(ae, unet, schedule, encode_cond, latent_std, test_ds,
-                              save_path=f"{FIGURES_DIR}/comparison_{COND_MODE}.png")
+                              save_path=f"{FIG_DIR}/comparison_{COND_MODE}.png")
 
     # Denoising steps comparison
     run_steps_comparison(ae, unet, schedule, encode_cond, latent_std, test_ds,
-                         save_path=f"{FIGURES_DIR}/steps_{COND_MODE}.png")
+                         save_path=f"{FIG_DIR}/steps_{COND_MODE}.png")
 
     # MRI ablation visualisation
     run_mri_ablation_visual(ae, unet, schedule, encode_cond, latent_std, test_ds,
-                            save_path=f"{FIGURES_DIR}/mri_ablation_{COND_MODE}.png")
+                            save_path=f"{FIG_DIR}/mri_ablation_{COND_MODE}.png")
 
-    # Multi-subject metrics
-    run_multi_subject_metrics(ae, unet, schedule, encode_cond, latent_std, test_ds)
+    # Multi-subject metrics + bar chart
+    maes, mses, nrmses, psnrs, ssims = run_multi_subject_metrics(ae, unet, schedule,
+                                                                  encode_cond, latent_std,
+                                                                  test_ds)
+    plot_multi_subject_ssim(ssims, COND_MODE,
+                            save_path=f"{FIG_DIR}/multi_subject_ssim_{COND_MODE}.png")
 
-    # ROI MSE table (Table II)
-    run_roi_mse_eval(ae, unet, schedule, encode_cond, latent_std, test_loader)
+    # ROI MSE table + heatmap
+    mse_table = run_roi_mse_eval(ae, unet, schedule, encode_cond, latent_std, test_loader)
+    plot_roi_heatmap(mse_table, COND_MODE,
+                     save_path=f"{FIG_DIR}/roi_heatmap_{COND_MODE}.png")
 
     # Ablation study (Table I)
     run_ablation_study(ae, unet, schedule, encode_cond, latent_std, test_loader)

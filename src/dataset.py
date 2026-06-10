@@ -14,6 +14,7 @@ Both modes:
     - Shuffle subjects before the 72 / 28 train / test split so AD and MCI
       cohorts are mixed in both partitions.
     - Volumes are normalised per-subject to [0, 1] and resampled to VOL_SHAPE.
+    - Masked to Desikan-Killiany (DK) atlas (86 regions).
     - MRI files: data/{1mm_parcellated_AD_subj,1mm_parcellated_MCI_subj}/*/T1_to_MNI_nonlin.nii.gz
     - PET files: data/cerebellumNormalized_AD_MCI/{AD,MCI}/RID_*/PET_MNISpace_SUVR_CerebellumNorm.nii[.gz]
 """
@@ -90,27 +91,48 @@ class TauPETDataset(Dataset):
                    (86,) atrophy z-scores [atrophy  mode]
     """
 
-    def __init__(self, pet_paths, mri_paths, cond_values):
-        self.pet_paths  = pet_paths
-        self.mri_paths  = mri_paths
+    def __init__(self, pet_paths, mri_paths, cond_values, use_dk_mask=True):
+        self.pet_paths   = pet_paths
+        self.mri_paths   = mri_paths
         self.cond_values = cond_values  # list of np.ndarray or float
+        self.use_dk_mask = use_dk_mask
+        self._mask_cache = {}
 
-    def _load(self, path):
+    def _get_dk_mask(self, idx):
+        """
+        Load DK atlas mask (labels 1-86 from T1_seg_in_MNI.nii.gz), cached after first load.
+        Masks out non-brain regions (skull, dura, ventricles, etc.).
+        """
+        if idx not in self._mask_cache:
+            import nibabel as nib
+            seg_path = os.path.join(os.path.dirname(self.mri_paths[idx]),
+                                    "T1_seg_in_MNI.nii.gz")
+            seg = nib.load(seg_path).get_fdata().astype(np.uint8)
+            mask = torch.from_numpy(((seg >= 1) & (seg <= 86)).astype(np.float32)).unsqueeze(0)
+            mask = F.interpolate(mask.unsqueeze(0), size=VOL_SHAPE,
+                                 mode="nearest").squeeze(0)
+            self._mask_cache[idx] = mask
+        return self._mask_cache[idx]
+
+    def _load(self, path, mask=None):
         import nibabel as nib
         vol = nib.load(path).get_fdata().astype(np.float32)
-        vol = (vol - vol.min()) / (vol.max() - vol.min() + 1e-8)
         vol = torch.tensor(vol).unsqueeze(0)
         vol = F.interpolate(
             vol.unsqueeze(0), size=VOL_SHAPE, mode="trilinear", align_corners=False
         ).squeeze(0)
-        return vol
+        if mask is not None:
+            vol = vol * mask
+        vmin, vmax = vol.min(), vol.max()
+        return (vol - vmin) / (vmax - vmin + 1e-8)
 
     def __len__(self):
         return len(self.pet_paths)
 
     def __getitem__(self, idx):
-        pet  = self._load(self.pet_paths[idx])
-        mri  = self._load(self.mri_paths[idx])
+        mask = self._get_dk_mask(idx) if self.use_dk_mask else None
+        pet  = self._load(self.pet_paths[idx], mask=mask)
+        mri  = self._load(self.mri_paths[idx], mask=mask)
         cond = torch.tensor(self.cond_values[idx], dtype=torch.float32)
         return pet, mri, cond
 
@@ -162,7 +184,7 @@ def _build_rid_to_ptau(fluid_csv):
 
 
 def build_dataloaders(mode: str, base_dir=BASE_DIR, batch_size=BATCH_SIZE,
-                      seed=SEED, val_fraction=0.15):
+                      seed=SEED, val_fraction=0.15, use_mask=False):
     """
     mode         : 'ptau217' or 'atrophy'
     val_fraction : fraction of training subjects to hold out as validation
@@ -214,9 +236,9 @@ def build_dataloaders(mode: str, base_dir=BASE_DIR, batch_size=BATCH_SIZE,
     val_n        = max(1, int(val_fraction * trainval_n))
     train_n      = trainval_n - val_n
 
-    train_ds = TauPETDataset(pet_paths[:train_n],             mri_paths[:train_n],             cond_vals[:train_n])
-    val_ds   = TauPETDataset(pet_paths[train_n:trainval_end], mri_paths[train_n:trainval_end], cond_vals[train_n:trainval_end])
-    test_ds  = TauPETDataset(pet_paths[trainval_end:],        mri_paths[trainval_end:],        cond_vals[trainval_end:])
+    train_ds = TauPETDataset(pet_paths[:train_n],             mri_paths[:train_n],             cond_vals[:train_n],             use_dk_mask=use_mask)
+    val_ds   = TauPETDataset(pet_paths[train_n:trainval_end], mri_paths[train_n:trainval_end], cond_vals[train_n:trainval_end], use_dk_mask=use_mask)
+    test_ds  = TauPETDataset(pet_paths[trainval_end:],        mri_paths[trainval_end:],        cond_vals[trainval_end:],        use_dk_mask=use_mask)
     print(f"Split: {len(train_ds)} train / {len(val_ds)} val / {len(test_ds)} test")
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,

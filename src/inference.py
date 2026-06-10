@@ -7,6 +7,28 @@ from .models import Autoencoder3D, DenoisingUNet3D
 from .conditioning import build_conditioner
 
 
+def _remap_unet_keys(state_dict):
+    """Remap standalone down modules to enc block submodule naming.
+
+    Checkpoint uses standalone down1/down2/down3 keys; model stores them as
+    enc1.downsample/enc2.downsample/enc3.downsample.
+    up1/up2/up3 stay as-is — they map directly to self.up1/up2/up3 standalone attrs.
+    """
+    remap = {
+        "down1": "enc1.downsample",
+        "down2": "enc2.downsample",
+        "down3": "enc3.downsample",
+    }
+    new_sd = {}
+    for k, v in state_dict.items():
+        prefix = k.split(".")[0]
+        if prefix in remap:
+            new_sd[k.replace(prefix, remap[prefix], 1)] = v
+        else:
+            new_sd[k] = v
+    return new_sd
+
+
 def load_models(checkpoint_path, mode, device=DEVICE):
     """Load ae, unet, conditioner, and latent_std from a checkpoint.
 
@@ -22,7 +44,7 @@ def load_models(checkpoint_path, mode, device=DEVICE):
 
     ckpt = torch.load(checkpoint_path, map_location=device)
     ae.load_state_dict(ckpt["ae"])
-    unet.load_state_dict(ckpt["unet"])
+    unet.load_state_dict(_remap_unet_keys(ckpt["unet"]))
     if ckpt.get("conditioner"):
         conditioner.load_state_dict(ckpt["conditioner"])
 

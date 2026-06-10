@@ -116,15 +116,68 @@ class AtrophyConditioner(nn.Module):
         return list(self.parameters())
 
 
+# ── combined conditioner ─────────────────────────────────────────────────────
+
+class CombinedConditioner(nn.Module):
+    """Encodes (B, 87) = [atrophy(86) ‖ ptau217(1)] into cross-attention tokens.
+
+    Atrophy → AtrophyConditioner MLP  → (B, 16, 512)
+    ptau217 → PTau217Conditioner CLIP → (B, seq, 512)
+    Output  → concatenated along dim=1 → (B, 16+seq, 512)
+
+    Only the atrophy MLP has trainable parameters; CLIP stays frozen.
+    """
+
+    out_dim = COND_DIM
+
+    def __init__(self, device=DEVICE):
+        super().__init__()
+        self.atrophy = AtrophyConditioner().to(device)
+        self.ptau    = PTau217Conditioner(device=device)
+
+    def encode(self, cond):
+        """cond : (B, 87) — first 86 dims = atrophy, last 1 = ptau217."""
+        atrophy_tokens = self.atrophy.encode(cond[:, :86])  # (B, 16, 512)
+        ptau_tokens    = self.ptau.encode(cond[:, 86:])     # (B, seq, 512)
+        return torch.cat([atrophy_tokens, ptau_tokens], dim=1)
+
+    def forward(self, x):
+        return self.encode(x)
+
+    def trainable_parameters(self):
+        return list(self.atrophy.parameters())
+
+    def state_dict(self):
+        return {"atrophy": self.atrophy.state_dict()}
+
+    def load_state_dict(self, sd, strict=True):
+        self.atrophy.load_state_dict(sd["atrophy"])
+
+    def train(self, mode=True):
+        self.atrophy.train(mode)
+        return self
+
+    def eval(self):
+        self.atrophy.eval()
+        return self
+
+    def to(self, device):
+        self.atrophy = self.atrophy.to(device)
+        self.ptau    = self.ptau.to(device)
+        return self
+
+
 # ── factory ───────────────────────────────────────────────────────────────────
 
 def build_conditioner(mode: str, device=DEVICE):
     """
-    mode : 'ptau217' or 'atrophy'
+    mode : 'ptau217', 'atrophy', or 'combined'
     Returns an initialised conditioner on the given device.
     """
     if mode == "ptau217":
         return PTau217Conditioner(device=device)
     if mode == "atrophy":
         return AtrophyConditioner().to(device)
-    raise ValueError(f"Unknown conditioning mode {mode!r}. Use 'ptau217' or 'atrophy'.")
+    if mode == "combined":
+        return CombinedConditioner(device=device)
+    raise ValueError(f"Unknown conditioning mode {mode!r}. Use 'ptau217', 'atrophy', or 'combined'.")

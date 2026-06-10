@@ -33,8 +33,10 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from src.config import (DEVICE, T_STEPS, LR, AE_EPOCHS, DIFF_EPOCHS, BATCH_SIZE,
-                        AE_CHECKPOINT_PATH, CHECKPOINT_DIR, FIGURES_DIR)
+                        AE_CHECKPOINT_PATH, CHECKPOINT_DIR, FIGURES_DIR, LATENT_CH)
 from src.dataset      import build_dataloaders
+from src import dataset_v2       as _dataset_v2
+from src import dataset_combined as _dataset_combined
 from src.models       import Autoencoder3D, DenoisingUNet3D
 from src.diffusion    import DiffusionSchedule
 from src.conditioning import build_conditioner
@@ -125,7 +127,7 @@ def train_ae(ae, train_loader, n_epochs, ckpt_path, device):
 # ── SSIM monitoring ───────────────────────────────────────────────────────────
 
 def _monitor_ssim(ae, unet, conditioner, schedule, latent_std,
-                  val_ds, epoch, figures_dir, device, n_steps=50):
+                  val_ds, epoch, monitor_dir, device, n_steps=50):
     """Quick SSIM on one fixed val sample — 2D mid-axial slice only.
 
     Uses val_ds[0] every call so the metric is comparable across epochs.
@@ -157,7 +159,6 @@ def _monitor_ssim(ae, unet, conditioner, schedule, latent_std,
     axes[2].set_title(f"SSIM={ssim_val:.3f}"); axes[2].axis("off")
     plt.tight_layout()
 
-    monitor_dir = os.path.join(figures_dir, "monitor")
     os.makedirs(monitor_dir, exist_ok=True)
     plt.savefig(os.path.join(monitor_dir, f"epoch_{epoch:04d}.png"),
                 dpi=100, bbox_inches="tight")
@@ -175,7 +176,8 @@ def _monitor_ssim(ae, unet, conditioner, schedule, latent_std,
 def train_diffusion(ae, unet, conditioner, schedule, latent_std,
                     latent_train_loader, latent_val_loader, val_ds,
                     n_epochs, start_epoch, ckpt_path, device,
-                    patience=100, val_every=10, monitor_every=25):
+                    patience=100, val_every=10, monitor_every=25,
+                    monitor_dir=None):
     """Train the diffusion U-Net on pre-cached latents.
 
     latent_train_loader / latent_val_loader: yield (z0, zm, cond) — no AE on GPU.
@@ -259,7 +261,9 @@ def train_diffusion(ae, unet, conditioner, schedule, latent_std,
         ssim_str = ""
         if (epoch + 1) % monitor_every == 0:
             ssim_val = _monitor_ssim(ae, unet, conditioner, schedule, latent_std,
-                                     val_ds, epoch + 1, FIGURES_DIR, device)
+                                     val_ds, epoch + 1,
+                                     monitor_dir or os.path.join(FIGURES_DIR, "monitor"),
+                                     device)
             ssim_str = f"  SSIM={ssim_val:.3f}"
 
         # ── Logging & checkpoint ──────────────────────────────────────────────
@@ -336,7 +340,7 @@ def quick_eval(ae, unet, conditioner, schedule, latent_std, test_ds,
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train TauGenNet")
-    p.add_argument("--mode",           choices=["ptau217", "atrophy"], required=True)
+    p.add_argument("--mode",           choices=["ptau217", "atrophy", "combined"], required=True)
     p.add_argument("--ae-epochs",      type=int,  default=AE_EPOCHS)
     p.add_argument("--diff-epochs",    type=int,  default=DIFF_EPOCHS)
     p.add_argument("--batch-size",     type=int,  default=BATCH_SIZE)
@@ -349,6 +353,12 @@ def parse_args():
     p.add_argument("--patience",       type=int,  default=100)
     p.add_argument("--val-every",      type=int,  default=10)
     p.add_argument("--monitor-every",  type=int,  default=25)
+    p.add_argument("--dataset",        choices=["v1", "v2"], default="v1",
+                   help="v1=original 72/11/28 split; v2=70/10/20 split (dataset_v2.py)")
+    p.add_argument("--monitor-dir",    type=str,  default=None,
+                   help="Directory for epoch monitoring figures (default: FIGURES_DIR/monitor)")
+    p.add_argument("--use-mask",       action="store_true", default=False,
+                   help="Apply gray-matter brain mask (T1_seg label==2) to MRI and PET volumes")
     return p.parse_args()
 
 
@@ -360,22 +370,33 @@ def main():
     diff_ckpt = os.path.join(args.checkpoint_dir, f"diff_{args.mode}.pt")
 
     # ── Dataset ───────────────────────────────────────────────────────────────
-    train_ds, val_ds, test_ds, train_loader, val_loader, _ = build_dataloaders(
-        mode=args.mode, batch_size=args.batch_size
+    if args.mode == "combined":
+        _build = _dataset_combined.build_dataloaders
+    elif args.dataset == "v2":
+        _build = _dataset_v2.build_dataloaders
+    else:
+        _build = build_dataloaders
+    train_ds, val_ds, test_ds, train_loader, val_loader, _ = _build(
+        mode=args.mode, batch_size=args.batch_size, use_dk_mask=args.use_mask
     )
     print(f"Mode: {args.mode}  |  train={len(train_ds)}  val={len(val_ds)}  test={len(test_ds)}")
 
     # ── Models ────────────────────────────────────────────────────────────────
     ae          = Autoencoder3D().to(device)
-    conditioner = build_conditioner(args.mode, device=device)
-    unet        = DenoisingUNet3D(context_dim=conditioner.out_dim).to(device)
-    schedule    = DiffusionSchedule(device=device)
-
     print(f"AE params:   {sum(p.numel() for p in ae.parameters()):,}")
-    print(f"UNet params: {sum(p.numel() for p in unet.parameters()):,}")
-    extra = sum(p.numel() for p in conditioner.trainable_parameters())
-    if extra:
-        print(f"Conditioner params: {extra:,}")
+
+    # Only create UNet/conditioner/schedule if doing diffusion training
+    conditioner = None
+    unet = None
+    schedule = None
+    if args.diff_epochs > 0:
+        conditioner = build_conditioner(args.mode, device=device)
+        unet        = DenoisingUNet3D(context_dim=conditioner.out_dim).to(device)
+        schedule    = DiffusionSchedule(device=device)
+        print(f"UNet params: {sum(p.numel() for p in unet.parameters()):,}")
+        extra = sum(p.numel() for p in conditioner.trainable_parameters())
+        if extra:
+            print(f"Conditioner params: {extra:,}")
 
     # ── Load or train AE ──────────────────────────────────────────────────────
     ae_losses = []
@@ -401,10 +422,10 @@ def main():
             unet.load_state_dict(ckpt["unet"])
             if ckpt.get("conditioner"):
                 conditioner.load_state_dict(ckpt["conditioner"])
-            latent_std = ckpt.get("latent_std", torch.ones(1, 4, 1, 1, 1)).to(device)
+            latent_std = ckpt.get("latent_std", torch.ones(1, LATENT_CH, 1, 1, 1)).to(device)  # was 4
             print(f"Loaded diffusion model from {diff_ckpt}")
         else:
-            latent_std = torch.ones(1, 4, 1, 1, 1, device=device)
+            latent_std = torch.ones(1, LATENT_CH, 1, 1, 1, device=device)  # was 4
         quick_eval(ae, unet, conditioner, schedule, latent_std,
                    test_ds, mode=args.mode, device=device)
         return
@@ -462,6 +483,7 @@ def main():
         patience=args.patience,
         val_every=args.val_every,
         monitor_every=args.monitor_every,
+        monitor_dir=args.monitor_dir,
     )
     diff_losses += new_losses
 
